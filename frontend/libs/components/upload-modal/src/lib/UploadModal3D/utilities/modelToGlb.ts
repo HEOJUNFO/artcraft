@@ -23,6 +23,22 @@ const PLY_FACE_ELEMENT = /^element\s+face\s+(\d+)\s*$/m;
 // PLY headers are short; only this much is decoded to sniff it.
 const PLY_HEADER_SNIFF_BYTES = 64 * 1024;
 
+// Same cap as the upload picker (file-uploader's maxSize={50}, decimal MB),
+// applied here too because window drag-and-drop skips the picker. Parse
+// time and memory grow linearly with the file, so this also bounds the
+// vertex and face counts: a 50 MB binary STL is about one million triangles.
+export const MAX_CONVERTIBLE_MODEL_BYTES = 50 * 1000 * 1000;
+
+export function assertConvertibleModelSize(byteLength: number): void {
+  if (byteLength === 0) throw new Error("The file is empty.");
+  if (byteLength > MAX_CONVERTIBLE_MODEL_BYTES) {
+    const mb = Math.ceil(byteLength / 1000 / 1000);
+    throw new Error(
+      `The file is ${mb} MB; the limit is ${MAX_CONVERTIBLE_MODEL_BYTES / 1000 / 1000} MB.`,
+    );
+  }
+}
+
 export function getConvertibleModelExtension(
   fileName: string,
 ): ConvertibleModelExtension | null {
@@ -42,7 +58,21 @@ export async function convertModelBufferToGlb(
   ext: ConvertibleModelExtension,
   name: string,
 ): Promise<ArrayBuffer> {
-  const object = parseModel(buffer, ext);
+  assertConvertibleModelSize(buffer.byteLength);
+  let object: THREE.Object3D;
+  try {
+    object = parseModel(buffer, ext);
+  } catch (error) {
+    // The loaders read binary bodies with DataView, so a header that
+    // promises more data than the file holds ends in a bare RangeError.
+    if (error instanceof RangeError) {
+      throw new Error("The file looks truncated or corrupted.");
+    }
+    throw error;
+  }
+  object.traverse((child) => {
+    if (child instanceof THREE.Mesh) assertValidGeometry(child.geometry);
+  });
   object.name = object.name || name;
   return exportGlb(object);
 }
@@ -127,11 +157,53 @@ function parsePly(buffer: ArrayBuffer): THREE.Object3D {
 // ─── helpers ──────────────────────────────────────────────────────────────
 
 function meshFromGeometry(geometry: THREE.BufferGeometry): THREE.Mesh {
-  if (!geometry.getAttribute("normal")) geometry.computeVertexNormals();
+  // Many STL writers leave every facet normal at 0 0 0; the exporter would
+  // turn those into (1, 0, 0) and light the mesh wrongly.
+  if (!hasUsableNormals(geometry)) geometry.computeVertexNormals();
   const material = new THREE.MeshStandardMaterial({
     vertexColors: geometry.hasAttribute("color"),
   });
   return new THREE.Mesh(geometry, material);
+}
+
+function hasUsableNormals(geometry: THREE.BufferGeometry): boolean {
+  const normal = geometry.getAttribute("normal");
+  if (!normal) return false;
+  for (let i = 0; i < normal.count; i++) {
+    const x = normal.getX(i);
+    const y = normal.getY(i);
+    const z = normal.getZ(i);
+    if (!(x * x + y * y + z * z > 1e-12)) return false;
+  }
+  return true;
+}
+
+// The loaders accept NaN coordinates and faces that point past the vertex
+// list (OBJ turns those into NaN positions, PLY keeps the bad index), and an
+// ASCII STL vertex line that doesn't parse is skipped, leaving a triangle
+// short. Any of these would end up in the GLB and break bounds and camera
+// fitting downstream, so refuse the file instead.
+function assertValidGeometry(geometry: THREE.BufferGeometry): void {
+  const position = geometry.getAttribute("position");
+  if (!position) return;
+  const values = position.array;
+  for (let i = 0; i < values.length; i++) {
+    if (!Number.isFinite(values[i])) {
+      throw new Error(
+        "Some vertex positions are not numbers, or a face points at a vertex that doesn't exist.",
+      );
+    }
+  }
+  const index = geometry.getIndex();
+  if (index) {
+    for (let i = 0; i < index.count; i++) {
+      if (index.getX(i) >= position.count) {
+        throw new Error("A face points at a vertex that doesn't exist.");
+      }
+    }
+  } else if (position.count % 3 !== 0) {
+    throw new Error("A face is missing vertices.");
+  }
 }
 
 function toStandardMaterial(material: THREE.Material): THREE.Material {

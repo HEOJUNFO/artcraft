@@ -1,5 +1,6 @@
 import {
   ConvertibleModelExtension,
+  assertConvertibleModelSize,
   convertModelBufferToGlb,
   getConvertibleModelExtension,
 } from "./modelToGlb";
@@ -32,6 +33,8 @@ import ConvertModelToGlbWorker from "./convertModelToGlb.worker?worker&inline";
 export async function convertModelToGlb(file: File): Promise<File> {
   const ext = getConvertibleModelExtension(file.name);
   if (!ext) throw new Error(`Unsupported model format: ${file.name}`);
+  // Before reading it into memory (the worker checks the buffer again).
+  assertConvertibleModelSize(file.size);
   const stem = file.name.slice(0, file.name.lastIndexOf("."));
   const glb = await convert(file, ext, stem);
   return new File([glb], `${stem}.glb`, { type: "model/gltf-binary" });

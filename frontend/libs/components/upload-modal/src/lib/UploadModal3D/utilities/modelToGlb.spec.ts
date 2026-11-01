@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import {
+  MAX_CONVERTIBLE_MODEL_BYTES,
   convertModelBufferToGlb,
   getConvertibleModelExtension,
 } from "./modelToGlb";
@@ -124,6 +125,20 @@ describe("convertModelBufferToGlb", () => {
         convertModelBufferToGlb(text("v 0 0 0\nv 1 0 0"), "obj", "empty"),
       ).rejects.toThrow("No faces found");
     });
+
+    it("rejects NaN coordinates", async () => {
+      const source = OBJ_QUAD.replace("v 1 1 0", "v NaN 1 0");
+      await expect(
+        convertModelBufferToGlb(text(source), "obj", "nan"),
+      ).rejects.toThrow("not numbers");
+    });
+
+    it("rejects a face index past the vertex list", async () => {
+      const source = OBJ_QUAD.replace("f 1 3 4", "f 1 3 99");
+      await expect(
+        convertModelBufferToGlb(text(source), "obj", "bad-index"),
+      ).rejects.toThrow("doesn't exist");
+    });
   });
 
   describe("stl", () => {
@@ -142,6 +157,40 @@ describe("convertModelBufferToGlb", () => {
     it("names the mesh after the file", async () => {
       const meshes = await convertAndReload(text(STL_ASCII_TRIANGLE), "stl");
       expect(meshes[0].name).toBe("model");
+    });
+
+    it("recomputes facet normals written as 0 0 0", async () => {
+      const source = STL_ASCII_TRIANGLE.replace(
+        "facet normal 0 0 1",
+        "facet normal 0 0 0",
+      );
+      const meshes = await convertAndReload(text(source), "stl");
+      const normal = meshes[0].geometry.getAttribute("normal");
+      expect([normal.getX(0), normal.getY(0), normal.getZ(0)]).toEqual([
+        0, 0, 1,
+      ]);
+    });
+
+    it("rejects a NaN vertex in a binary STL", async () => {
+      const buffer = binaryStl(1);
+      new DataView(buffer).setFloat32(84 + 12, NaN, true);
+      await expect(
+        convertModelBufferToGlb(buffer, "stl", "nan"),
+      ).rejects.toThrow("not numbers");
+    });
+
+    it("rejects an ASCII STL vertex that doesn't parse", async () => {
+      const source = STL_ASCII_TRIANGLE.replace("vertex 1 0 0", "vertex x 0 0");
+      await expect(
+        convertModelBufferToGlb(text(source), "stl", "short"),
+      ).rejects.toThrow("missing vertices");
+    });
+
+    it("reports a truncated binary STL", async () => {
+      const buffer = binaryStl(2).slice(0, 84 + 50);
+      await expect(
+        convertModelBufferToGlb(buffer, "stl", "truncated"),
+      ).rejects.toThrow("truncated or corrupted");
     });
   });
 
@@ -172,6 +221,48 @@ describe("convertModelBufferToGlb", () => {
       await expect(
         convertModelBufferToGlb(text(PLY_POINT_CLOUD), "ply", "points"),
       ).rejects.toThrow("point cloud");
+    });
+
+    it.each(["binary_little_endian", "binary_big_endian"] as const)(
+      "exports a %s PLY and keeps its normals and colors",
+      async (format) => {
+        const meshes = await convertAndReload(binaryPly(format), "ply");
+        const geometry = meshes[0].geometry;
+        expect(triangleCount(meshes[0])).toBe(1);
+        expect(geometry.getAttribute("color")).toBeDefined();
+        const normal = geometry.getAttribute("normal");
+        expect([normal.getX(0), normal.getY(0), normal.getZ(0)]).toEqual([
+          0, 0, 1,
+        ]);
+      },
+    );
+
+    it("rejects a face index past the vertex list", async () => {
+      const source = PLY_COLORED_TRIANGLE.replace("3 0 1 2", "3 0 1 99");
+      await expect(
+        convertModelBufferToGlb(text(source), "ply", "bad-index"),
+      ).rejects.toThrow("doesn't exist");
+    });
+  });
+
+  describe("limits", () => {
+    it.each(["obj", "stl", "ply"] as const)(
+      "rejects an empty %s file",
+      async (ext) => {
+        await expect(
+          convertModelBufferToGlb(new ArrayBuffer(0), ext, "empty"),
+        ).rejects.toThrow("The file is empty.");
+      },
+    );
+
+    it("rejects files over the size limit before parsing", async () => {
+      await expect(
+        convertModelBufferToGlb(
+          new ArrayBuffer(MAX_CONVERTIBLE_MODEL_BYTES + 1),
+          "stl",
+          "huge",
+        ),
+      ).rejects.toThrow("the limit is 50 MB");
     });
   });
 });
@@ -217,4 +308,53 @@ function binaryStl(triangles: number): ArrayBuffer {
     floats.forEach((value, i) => view.setFloat32(offset + i * 4, value, true));
   }
   return view.buffer;
+}
+
+// One triangle in the z = 0 plane with float normals and uchar colors.
+function binaryPly(
+  format: "binary_little_endian" | "binary_big_endian",
+): ArrayBuffer {
+  const header = [
+    "ply",
+    `format ${format} 1.0`,
+    "element vertex 3",
+    "property float x",
+    "property float y",
+    "property float z",
+    "property float nx",
+    "property float ny",
+    "property float nz",
+    "property uchar red",
+    "property uchar green",
+    "property uchar blue",
+    "element face 1",
+    "property list uchar int vertex_indices",
+    "end_header",
+    "",
+  ].join("\n");
+  const headerBytes = new TextEncoder().encode(header);
+  const vertexBytes = 6 * 4 + 3;
+  const buffer = new ArrayBuffer(headerBytes.length + 3 * vertexBytes + 1 + 12);
+  new Uint8Array(buffer).set(headerBytes);
+  const view = new DataView(buffer);
+  const little = format === "binary_little_endian";
+  const positions = [
+    [0, 0, 0],
+    [1, 0, 0],
+    [0, 1, 0],
+  ];
+  let offset = headerBytes.length;
+  for (const position of positions) {
+    for (const value of [...position, 0, 0, 1]) {
+      view.setFloat32(offset, value, little);
+      offset += 4;
+    }
+    for (const value of [255, 0, 0]) view.setUint8(offset++, value);
+  }
+  view.setUint8(offset++, 3);
+  for (const index of [0, 1, 2]) {
+    view.setInt32(offset, index, little);
+    offset += 4;
+  }
+  return buffer;
 }
